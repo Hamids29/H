@@ -1,55 +1,7 @@
-WITH patient_program_status AS (
-    SELECT
-        p.patient_id,
-        p.persistence_days,
-        p.spp_first_ship_date,
-        p.spp_last_ship_date,
-        MAX(CASE WHEN c.successful_call_flag = 'Y' AND call_outcome = 'Erleada - Welcome Call Completed' THEN 1 ELSE 0 END) AS enrolled_engaged_program_patient,
-        CASE
-            WHEN p.spp_last_ship_date >= '2023-12-31'::date - INTERVAL '90 days' THEN 1
-            ELSE 0
-        END AS is_active_spp_patient
-    FROM
-        patiente2e_new_vw.vw_events_patient_aggregate_erleada p
-    LEFT JOIN
-        patiente2e_new_vw.vw_syneos_case c ON p.patient_id = c.patient_id
-    WHERE
-        (p.spp_first_ship_date >= '2023-01-01' OR p.claims_first_ship_date >= '2023-01-01')
-        AND (p.spp_first_ship_date <= '2023-12-31' OR p.claims_first_ship_date <= '2023-12-31')
-    GROUP BY
-        p.patient_id,
-        p.persistence_days,
-        p.spp_first_ship_date,
-        p.spp_last_ship_date
-),
-enrollment_methods AS (
-    SELECT
-        pps.patient_id,
-        e.received_method,
-        pps.persistence_days,
-        pps.is_active_spp_patient,
-        CASE WHEN pps.enrolled_engaged_program_patient > 0 THEN 'Program Patient' ELSE 'Non-Program Patient' END AS program_status
-    FROM
-        patient_program_status pps
-    JOIN
-        patiente2e_new_vw.vw_syneos_enrollement e ON pps.patient_id = e.patient_id
-    WHERE
-        EXTRACT(YEAR FROM e.received_date) = 2023
-)
-SELECT
-    received_method,
-    COUNT(patient_id) AS patient_count,
-    AVG(persistence_days) AS avg_persistence_days,
-    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY persistence_days) AS median_persistence_days,
-    SUM(is_active_spp_patient) AS active_patients,
-    (SUM(is_active_spp_patient) * 100.0 / COUNT(patient_id)) AS active_percentage,
-    ROUND(COALESCE(SUM(CASE WHEN persistence_days > 180 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(patient_id), 0), 0), 4) AS percentage_gt_180_days,
-    COUNT(CASE WHEN program_status = 'Program Patient' THEN patient_id END) AS program_patients,
-    COUNT(CASE WHEN program_status = 'Non-Program Patient' THEN patient_id END) AS non_program_patients,
-    (COUNT(CASE WHEN program_status = 'Program Patient' THEN patient_id END) * 100.0 / COUNT(patient_id)) AS program_percentage
-FROM
-    enrollment_methods
-GROUP BY
-    received_method
-ORDER BY
-    patient_count DESC;
+SELECT 
+    COUNT(*) as total_patients,
+    COUNT(CASE WHEN shipdate IS NOT NULL THEN 1 END) as patients_with_shipment,
+    COUNT(CASE WHEN shipdate IS NULL THEN 1 END) as patients_without_shipment
+FROM cdp.prometrics_sp_data_pull
+WHERE refdate >= '2025-02-01'
+    AND refdate <= '2025-04-30';
