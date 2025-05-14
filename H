@@ -1,7 +1,22 @@
 SELECT 
+    pmcpatientid,
+    patstate,
+    shipdate,
+    max_ship_date,
+    days_active,
+    refdate
+FROM cdp.prometrics_sp_data_pull
+WHERE refdate >= '2025-02-01'
+    AND refdate <= '2025-04-30'
+ORDER BY refdate, pmcpatientid;
+
+-- Summary query showing counts of patients with and without shipments
+SELECT 
     COUNT(*) as total_patients,
     COUNT(CASE WHEN shipdate IS NOT NULL THEN 1 END) as patients_with_shipment,
-    COUNT(CASE WHEN shipdate IS NULL THEN 1 END) as patients_without_shipment
+    COUNT(CASE WHEN shipdate IS NULL THEN 1 END) as patients_without_shipment,
+    ROUND(COUNT(CASE WHEN shipdate IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 2) as percentage_with_shipment,
+    ROUND(COUNT(CASE WHEN shipdate IS NULL THEN 1 END) * 100.0 / COUNT(*), 2) as percentage_without_shipment
 FROM cdp.prometrics_sp_data_pull
 WHERE refdate >= '2025-02-01'
     AND refdate <= '2025-04-30';
