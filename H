@@ -4,6 +4,7 @@ from datetime import datetime
 def analyze_shipment_data(file_path):
     """
     Analyze shipment data from Excel file and generate metrics by District Name and Referral Month.
+    This version searches for columns by their content pattern, not by column names.
     
     Args:
         file_path (str): Path to the Excel file
@@ -13,39 +14,112 @@ def analyze_shipment_data(file_path):
     """
     
     try:
-        # Read the Excel file
+        # Read the Excel file with multiple strategies
         print(f"Reading file: {file_path}")
-        df = pd.read_excel(file_path)
         
-        # Verify required columns exist
-        required_columns = ['District Name', 'referral month', 'Shipment Status']
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        # Try reading with different parameters
+        try:
+            # First attempt - normal read
+            df = pd.read_excel(file_path)
+        except:
+            try:
+                # Second attempt - skip first row if it's merged cells or formatting
+                df = pd.read_excel(file_path, header=1)
+            except:
+                # Third attempt - no header, we'll find it ourselves
+                df = pd.read_excel(file_path, header=None)
         
-        if missing_columns:
-            print(f"Error: Missing required columns: {missing_columns}")
-            print(f"Available columns: {list(df.columns)}")
-            return None
+        print(f"DataFrame shape: {df.shape}")
+        print(f"Columns: {df.columns.tolist()}")
         
-        # Clean and prepare the data
-        # Handle potential variations in column names (case insensitive)
-        df.columns = df.columns.str.strip()
+        # If all columns are unnamed, try to find the header row
+        if all('Unnamed' in str(col) for col in df.columns) or all(df.columns.isna()):
+            print("Detecting header row...")
+            # Look for the row that contains our target columns
+            target_terms = ['district', 'referral', 'shipment']
+            
+            for i in range(min(10, len(df))):  # Check first 10 rows
+                row_str = ' '.join(str(val).lower() for val in df.iloc[i] if pd.notna(val))
+                if all(term in row_str for term in target_terms):
+                    print(f"Found header row at index {i}")
+                    # Use this row as column names
+                    df.columns = df.iloc[i]
+                    df = df.iloc[i+1:].reset_index(drop=True)
+                    break
         
-        # Find the actual column names (case insensitive)
+        # Now find the columns by pattern matching
         district_col = None
         referral_col = None
         shipment_col = None
         
+        # Search for columns by content pattern, not name
+        print("\nSearching for columns by content...")
+        
+        # Look through each column to find the right ones
         for col in df.columns:
-            if col.lower().strip() == 'district name':
+            # Get sample values from this column (first 100 non-null values)
+            sample_values = df[col].dropna().head(100).astype(str)
+            
+            if sample_values.empty:
+                continue
+                
+            # Join sample values to search for patterns
+            sample_text = ' '.join(sample_values.str.lower())
+            
+            # Check for district patterns
+            if not district_col and 'district' in sample_text:
                 district_col = col
-            elif col.lower().strip() == 'referral month':
-                referral_col = col
-            elif col.lower().strip() == 'shipment status':
-                shipment_col = col
+                print(f"Found district column: {col}")
+            
+            # Check for referral month patterns (look for date formats)
+            if not referral_col:
+                # Look for patterns like YYYY-MM or mentions of months
+                date_patterns = any(x in sample_text for x in ['2024', '2025', 'jan', 'feb', 'mar', 'apr', 'may', 'jun'])
+                if date_patterns or 'referral' in str(col).lower():
+                    # Verify it contains date-like values
+                    date_count = sum(1 for val in sample_values if '-' in val and len(val) == 7)
+                    if date_count > len(sample_values) * 0.1:  # At least 10% are date-like
+                        referral_col = col
+                        print(f"Found referral month column: {col}")
+            
+            # Check for shipment status patterns
+            if not shipment_col:
+                shipment_terms = ['ship', 'did not ship', 'less than 84', 'shipment']
+                if any(term in sample_text for term in shipment_terms):
+                    shipment_col = col
+                    print(f"Found shipment status column: {col}")
+        
+        # If still not found, check column names more broadly
+        if not all([district_col, referral_col, shipment_col]):
+            print("\nTrying column name matching...")
+            for col in df.columns:
+                col_str = str(col).lower()
+                if not district_col and 'district' in col_str:
+                    district_col = col
+                if not referral_col and ('referral' in col_str or 'month' in col_str):
+                    referral_col = col
+                if not shipment_col and ('shipment' in col_str or 'ship' in col_str):
+                    shipment_col = col
         
         if not all([district_col, referral_col, shipment_col]):
-            print("Error: Could not find required columns (case insensitive)")
+            print("Error: Could not identify all required columns")
+            print("Please check these column samples:")
+            
+            # Show first few rows of data to help identify columns
+            print("\nFirst 5 rows of data:")
+            print(df.head())
+            
+            # Show unique values in each column
+            for col in df.columns:
+                print(f"\nColumn '{col}' sample values:")
+                print(df[col].dropna().head(10).tolist())
+            
             return None
+        
+        print(f"\nUsing columns:")
+        print(f"District: {district_col}")
+        print(f"Referral Month: {referral_col}")
+        print(f"Shipment Status: {shipment_col}")
         
         # Clean the data
         df[district_col] = df[district_col].astype(str).str.strip()
@@ -55,13 +129,21 @@ def analyze_shipment_data(file_path):
         # Remove rows with missing values in key columns
         df = df.dropna(subset=[district_col, referral_col, shipment_col])
         
-        # Filter for relevant shipment statuses
-        relevant_statuses = df[shipment_col].isin(['Ship in less than 84 days', 'Did not ship'])
-        df_filtered = df[relevant_statuses].copy()
+        # Check what shipment statuses we have
+        print(f"\nUnique shipment statuses found:")
+        print(df[shipment_col].unique())
+        
+        # Filter for relevant shipment statuses (case insensitive)
+        df_filtered = df[df[shipment_col].str.lower().isin(['ship in less than 84 days', 'did not ship'])].copy()
         
         if df_filtered.empty:
             print("Warning: No rows found with 'Ship in less than 84 days' or 'Did not ship' status")
-            print(f"Available statuses: {df[shipment_col].unique()}")
+            # Try fuzzy matching
+            print("Trying fuzzy matching for shipment statuses...")
+            statuses = df[shipment_col].unique()
+            for status in statuses:
+                if '84' in str(status) or 'ship' in str(status).lower():
+                    print(f"Found potential match: {status}")
             return None
         
         # Group by District Name and Referral Month
@@ -103,14 +185,12 @@ def analyze_shipment_data(file_path):
     
     except Exception as e:
         print(f"Error processing file: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 # Run the analysis
 file_path = "frminfo.xlsx"  # Change this if your file is in a different location
-
-# If your file is in a different directory, you can specify the full path:
-# file_path = "/path/to/your/frminfo.xlsx"  # Unix/Mac
-# file_path = r"C:\path\to\your\frminfo.xlsx"  # Windows
 
 # Analyze the data
 results = analyze_shipment_data(file_path)
@@ -132,3 +212,5 @@ if results is not None:
     # Save results to Excel (optional)
     results.to_excel('shipment_analysis_results.xlsx', index=False)
     print("\nResults saved to: shipment_analysis_results.xlsx")
+else:
+    print("\nAnalysis failed. Please check the error messages above for guidance.")
