@@ -178,8 +178,44 @@ def analyze_shipment_data(file_path):
         # Create results DataFrame
         results_df = pd.DataFrame(results)
         
-        # Sort by District Name and Referral Month
-        results_df = results_df.sort_values(['District Name', 'Referral Month'])
+        if not results_df.empty:
+            # Calculate totals for each district across all months
+            district_totals = []
+            
+            for district in results_df['District Name'].unique():
+                district_data = results_df[results_df['District Name'] == district]
+                
+                total_ship_less_84 = district_data['Ship in less than 84 days'].sum()
+                total_did_not_ship = district_data['Did not ship'].sum()
+                total_shipments = total_ship_less_84 + total_did_not_ship
+                
+                if total_shipments > 0:
+                    total_ship_percentage = total_ship_less_84 / total_shipments
+                else:
+                    total_ship_percentage = 0
+                
+                district_totals.append({
+                    'District Name': district,
+                    'Referral Month': 'ALL MONTHS - TOTAL',
+                    'Ship in less than 84 days': total_ship_less_84,
+                    'Did not ship': total_did_not_ship,
+                    'Total shipments': total_shipments,
+                    'Ship percentage': total_ship_percentage,
+                    'Ship percentage (%)': round(total_ship_percentage * 100, 2)
+                })
+            
+            # Create DataFrame for district totals
+            district_totals_df = pd.DataFrame(district_totals)
+            
+            # Combine original results with district totals
+            results_df = pd.concat([results_df, district_totals_df], ignore_index=True)
+            
+            # Sort: First by District Name, then put totals after individual months
+            results_df['sort_key'] = results_df['Referral Month'].apply(
+                lambda x: 'z_total' if 'ALL MONTHS' in str(x) else str(x)
+            )
+            results_df = results_df.sort_values(['District Name', 'sort_key'])
+            results_df = results_df.drop('sort_key', axis=1)
         
         return results_df
     
