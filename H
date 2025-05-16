@@ -1,5 +1,4 @@
 import pandas as pd
-import sys
 from datetime import datetime
 
 def analyze_shipment_data(file_path):
@@ -106,43 +105,30 @@ def analyze_shipment_data(file_path):
         print(f"Error processing file: {str(e)}")
         return None
 
-def save_results(results_df, output_file='shipment_analysis_results.xlsx'):
-    """Save results to Excel file"""
-    try:
-        results_df.to_excel(output_file, index=False)
-        print(f"Results saved to: {output_file}")
-    except Exception as e:
-        print(f"Error saving results: {str(e)}")
+# Run the analysis
+file_path = "frminfo.xlsx"  # Change this if your file is in a different location
 
-def main():
-    # Check if file path is provided as command line argument
-    if len(sys.argv) < 2:
-        print("Usage: python shipment_analyzer.py <path_to_excel_file>")
-        print("Example: python shipment_analyzer.py data.xlsx")
-        return
-    
-    file_path = sys.argv[1]
-    
-    # Analyze the data
-    results = analyze_shipment_data(file_path)
-    
-    if results is not None:
-        print("\nAnalysis complete!")
-        print(f"Total combinations found: {len(results)}")
-        
-        # Display sample results
-        print("\nSample results:")
-        print(results.head(10).to_string(index=False))
-        
-        # Save results
-        save_results(results)
-        
-        # Display summary statistics
-        print("\nSummary Statistics:")
-        print(f"Total shipments across all districts/months: {results['Total shipments'].sum()}")
-        print(f"Overall ship percentage: {results['Ship in less than 84 days'].sum() / results['Total shipments'].sum() * 100:.2f}%")
-        print(f"Number of unique districts: {results['District Name'].nunique()}")
-        print(f"Number of unique months: {results['Referral Month'].nunique()}")
+# If your file is in a different directory, you can specify the full path:
+# file_path = "/path/to/your/frminfo.xlsx"  # Unix/Mac
+# file_path = r"C:\path\to\your\frminfo.xlsx"  # Windows
 
-if __name__ == "__main__":
-    main()
+# Analyze the data
+results = analyze_shipment_data(file_path)
+
+if results is not None:
+    print("\nAnalysis complete!")
+    print(f"Total combinations found: {len(results)}")
+    
+    # Display results (Jupyter will show this nicely formatted)
+    display(results)
+    
+    # Display summary statistics
+    print("\nSummary Statistics:")
+    print(f"Total shipments across all districts/months: {results['Total shipments'].sum()}")
+    print(f"Overall ship percentage: {results['Ship in less than 84 days'].sum() / results['Total shipments'].sum() * 100:.2f}%")
+    print(f"Number of unique districts: {results['District Name'].nunique()}")
+    print(f"Number of unique months: {results['Referral Month'].nunique()}")
+    
+    # Save results to Excel (optional)
+    results.to_excel('shipment_analysis_results.xlsx', index=False)
+    print("\nResults saved to: shipment_analysis_results.xlsx")
