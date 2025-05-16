@@ -1,1 +1,148 @@
+import pandas as pd
+import sys
+from datetime import datetime
 
+def analyze_shipment_data(file_path):
+    """
+    Analyze shipment data from Excel file and generate metrics by District Name and Referral Month.
+    
+    Args:
+        file_path (str): Path to the Excel file
+    
+    Returns:
+        pandas.DataFrame: Summary data with metrics
+    """
+    
+    try:
+        # Read the Excel file
+        print(f"Reading file: {file_path}")
+        df = pd.read_excel(file_path)
+        
+        # Verify required columns exist
+        required_columns = ['District Name', 'referral month', 'Shipment Status']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            print(f"Error: Missing required columns: {missing_columns}")
+            print(f"Available columns: {list(df.columns)}")
+            return None
+        
+        # Clean and prepare the data
+        # Handle potential variations in column names (case insensitive)
+        df.columns = df.columns.str.strip()
+        
+        # Find the actual column names (case insensitive)
+        district_col = None
+        referral_col = None
+        shipment_col = None
+        
+        for col in df.columns:
+            if col.lower().strip() == 'district name':
+                district_col = col
+            elif col.lower().strip() == 'referral month':
+                referral_col = col
+            elif col.lower().strip() == 'shipment status':
+                shipment_col = col
+        
+        if not all([district_col, referral_col, shipment_col]):
+            print("Error: Could not find required columns (case insensitive)")
+            return None
+        
+        # Clean the data
+        df[district_col] = df[district_col].astype(str).str.strip()
+        df[referral_col] = df[referral_col].astype(str).str.strip()
+        df[shipment_col] = df[shipment_col].astype(str).str.strip()
+        
+        # Remove rows with missing values in key columns
+        df = df.dropna(subset=[district_col, referral_col, shipment_col])
+        
+        # Filter for relevant shipment statuses
+        relevant_statuses = df[shipment_col].isin(['Ship in less than 84 days', 'Did not ship'])
+        df_filtered = df[relevant_statuses].copy()
+        
+        if df_filtered.empty:
+            print("Warning: No rows found with 'Ship in less than 84 days' or 'Did not ship' status")
+            print(f"Available statuses: {df[shipment_col].unique()}")
+            return None
+        
+        # Group by District Name and Referral Month
+        results = []
+        
+        grouped = df_filtered.groupby([district_col, referral_col])
+        
+        for (district, month), group in grouped:
+            # Count occurrences of each status
+            status_counts = group[shipment_col].value_counts()
+            
+            ship_less_84 = status_counts.get('Ship in less than 84 days', 0)
+            did_not_ship = status_counts.get('Did not ship', 0)
+            total_shipments = ship_less_84 + did_not_ship
+            
+            # Calculate percentage (avoid division by zero)
+            if total_shipments > 0:
+                ship_percentage = ship_less_84 / total_shipments
+            else:
+                ship_percentage = 0
+            
+            results.append({
+                'District Name': district,
+                'Referral Month': month,
+                'Ship in less than 84 days': ship_less_84,
+                'Did not ship': did_not_ship,
+                'Total shipments': total_shipments,
+                'Ship percentage': ship_percentage,
+                'Ship percentage (%)': round(ship_percentage * 100, 2)
+            })
+        
+        # Create results DataFrame
+        results_df = pd.DataFrame(results)
+        
+        # Sort by District Name and Referral Month
+        results_df = results_df.sort_values(['District Name', 'Referral Month'])
+        
+        return results_df
+    
+    except Exception as e:
+        print(f"Error processing file: {str(e)}")
+        return None
+
+def save_results(results_df, output_file='shipment_analysis_results.xlsx'):
+    """Save results to Excel file"""
+    try:
+        results_df.to_excel(output_file, index=False)
+        print(f"Results saved to: {output_file}")
+    except Exception as e:
+        print(f"Error saving results: {str(e)}")
+
+def main():
+    # Check if file path is provided as command line argument
+    if len(sys.argv) < 2:
+        print("Usage: python shipment_analyzer.py <path_to_excel_file>")
+        print("Example: python shipment_analyzer.py data.xlsx")
+        return
+    
+    file_path = sys.argv[1]
+    
+    # Analyze the data
+    results = analyze_shipment_data(file_path)
+    
+    if results is not None:
+        print("\nAnalysis complete!")
+        print(f"Total combinations found: {len(results)}")
+        
+        # Display sample results
+        print("\nSample results:")
+        print(results.head(10).to_string(index=False))
+        
+        # Save results
+        save_results(results)
+        
+        # Display summary statistics
+        print("\nSummary Statistics:")
+        print(f"Total shipments across all districts/months: {results['Total shipments'].sum()}")
+        print(f"Overall ship percentage: {results['Ship in less than 84 days'].sum() / results['Total shipments'].sum() * 100:.2f}%")
+        print(f"Number of unique districts: {results['District Name'].nunique()}")
+        print(f"Number of unique months: {results['Referral Month'].nunique()}")
+
+if __name__ == "__main__":
+    main()
