@@ -12,6 +12,8 @@ WITH spravato_shipments AS (
     WHERE 
         product = 'SPRAVATO'
         AND ship_date IS NOT NULL
+        AND rx_date >= '2023-01-01'
+        AND rx_date <= '2023-12-31'
 ),
 patient_persistence AS (
     SELECT 
@@ -38,9 +40,6 @@ patient_persistence AS (
         END as is_active_patient
     FROM 
         spravato_shipments
-    WHERE 
-        first_rx_date >= '2023-01-01'
-        AND first_rx_date <= '2023-12-31'
     GROUP BY 
         patient_id
 )
