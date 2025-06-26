@@ -33,9 +33,9 @@ patient_with_status AS (
 )
 SELECT
     provider_id,
-    COUNT(patient_id) FILTER (WHERE engagement_status = 'Program Patient') AS program_patient_count,
-    COUNT(patient_id) FILTER (WHERE engagement_status = 'Not A Program Patient') AS non_program_patient_count,
-    COUNT(patient_id) AS total_patient_count
+    SUM(CASE WHEN engagement_status = 'Program Patient' THEN 1 ELSE 0 END) AS program_patient_count,
+    SUM(CASE WHEN engagement_status = 'Not A Program Patient' THEN 1 ELSE 0 END) AS non_program_patient_count,
+    COUNT(*) AS total_patient_count
 FROM
     patient_with_status
 GROUP BY
