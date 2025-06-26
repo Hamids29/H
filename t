@@ -2,7 +2,10 @@ WITH patient_metrics AS (
     SELECT
         p.patient_id,
         p.provider_id,
-        MAX(CASE WHEN c.successful_call_flag = 'Y' AND call_outcome = 'Erleada - Welcome Call Completed' THEN 1 ELSE 0 END) AS enrolled_engaged_program_patient
+        MAX(CASE 
+            WHEN c.successful_call_flag = 'Y' 
+                 AND call_outcome = 'Erleada - Welcome Call Completed' 
+            THEN 1 ELSE 0 END) AS enrolled_engaged_program_patient
     FROM
         patiente2e_new_vw.vw_events_patient_aggregate_erleada p
     LEFT JOIN
@@ -39,4 +42,3 @@ GROUP BY
     provider_id
 ORDER BY
     provider_id;
-
