@@ -1,64 +1,130 @@
+import time
+import unicodedata
 import pandas as pd
 import requests
 
-def get_npis_with_taxonomy(name, city, state, target_taxonomy="General Acute Care Hospital"):
-    api_url = "https://npiregistry.cms.hhs.gov/api/"
+BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
+
+def _norm(s):
+    if s is None:
+        return ""
+    # ASCII fold + lowercase + strip extra spaces
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    return " ".join(s.lower().split())
+
+def _primary_location_addr(addresses):
+    """
+    NPPES spec: addresses[0] = Primary Practice Location, addresses[1] = Mailing
+    """
+    if not addresses:
+        return {}
+    return addresses[0] or {}
+
+def get_npis_with_taxonomy(name, city, state, target_taxonomy="General Acute Care Hospital", limit_per_req=200, max_pages=6, sleep_s=0.2):
+    """
+    Returns a list of matches (dicts) so you can choose; also prints them.
+    """
     params = {
         "version": "2.1",
-        "organization_name": name,
+        "enumeration_type": "NPI-2",                  # organizations
+        "organization_name": name,                    # supports wildcards server-side
         "city": city,
         "state": state,
-        "limit": 20  # Fetch more results to find the best match
+        "taxonomy_description": target_taxonomy,
+        "limit": min(limit_per_req, 200)
     }
-    try:
-        response = requests.get(api_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        results = data.get('results', [])
-        
-        # Collect all NPIs with the target taxonomy
-        matched_npis = []
-        for result in results:
-            taxonomies = result.get('taxonomies', [])
-            taxonomy_descs = [tax.get('desc', '') for tax in taxonomies]
-            if target_taxonomy in taxonomy_descs:
-                matched_npis.append({
-                    'npi': result.get('number', ''),
-                    'name': result.get('organization_name', ''),
-                    'city': result.get('city', ''),
-                    'state': result.get('state', ''),
-                    'taxonomies': taxonomy_descs
-                })
-        
-        # Print each match found
-        for match in matched_npis:
-            print(f"Match Found: NPI: {match['npi']}, Name: {match['name']}, Location: {match['city']}, {match['state']}, Taxonomies: {match['taxonomies']}")
-        
-        # Return the first match or "Not Found"
-        if matched_npis:
-            return matched_npis[0]['npi']
-        else:
-            return "Not Found"
-    except Exception as e:
-        print(f"Error fetching NPIs for {name}: {e}")
-        return "Error"
 
-# Load your data
+    all_results = []
+    skip = 0
+    for _ in range(max_pages):
+        params["skip"] = skip
+        try:
+            r = requests.get(BASE_URL, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            print(f"Error fetching NPIs for {name}: {e}")
+            break
+
+        results = data.get("results", []) or []
+        if not results:
+            break
+
+        all_results.extend(results)
+        # pagination guard
+        if len(results) < params["limit"]:
+            break
+        skip += params["limit"]
+        if skip > 1000:  # API hard cap
+            break
+        time.sleep(sleep_s)
+
+    # Normalize inputs for post-filtering safety
+    n_city = _norm(city)
+    n_state = _norm(state)
+    n_name = _norm(name)
+    n_tax = _norm(target_taxonomy)
+
+    matched = []
+    for res in all_results:
+        basic = res.get("basic", {}) or {}
+        org_name = basic.get("organization_name") or basic.get("authorized_official_organization_name") or ""
+        taxonomies = res.get("taxonomies", []) or []
+        tax_descs = [t.get("desc", "") for t in taxonomies]
+        tax_descs_norm = [_norm(d) for d in tax_descs]
+
+        # Ensure taxonomy hit (server-side already filters, but keep client-side guard)
+        if n_tax and n_tax not in tax_descs_norm:
+            continue
+
+        # Location city/state check (primary practice location)
+        loc = _primary_location_addr(res.get("addresses", []))
+        loc_city = _norm(loc.get("city"))
+        loc_state = _norm(loc.get("state"))
+
+        if n_city and n_city != loc_city:
+            continue
+        if n_state and n_state != loc_state:
+            continue
+
+        matched.append({
+            "npi": res.get("number", ""),
+            "name": org_name,
+            "city": loc.get("city", ""),
+            "state": loc.get("state", ""),
+            "taxonomies": tax_descs
+        })
+
+    for m in matched:
+        print(f"Match Found: NPI: {m['npi']}, Name: {m['name']}, Location: {m['city']}, {m['state']}, Taxonomies: {m['taxonomies']}")
+
+    return matched
+
+# ---- Batch over Excel ----
 input_filepath = "test_unknown_joint_knee_npi.xlsx"
 output_filepath = "test_unknown_acuitymd_npi_here_2025_knee_surg.xlsx"
 
 df = pd.read_excel(input_filepath)
-df['NPI'] = ""
+if "NPI" not in df.columns:
+    df["NPI"] = ""
 
-# Loop through each row to get NPIs based on the organization details
+# Optional: set your taxonomy target here if you're actually after ortho/knee
+# e.g., "Orthopaedic Surgery" (taxonomy 207X00000X) or a more specific subspecialty
+TARGET_TAXONOMY = "General Acute Care Hospital"
+
 for idx, row in df.iterrows():
-    name = row['name']
-    city = row['city']
-    state = row['state']
-    npi = get_npis_with_taxonomy(name, city, state)
-    df.at[idx, 'NPI'] = npi
-    print(f"Processed {name} in {city}, {state} - NPI: {npi}")
+    name = str(row.get("name", "")).strip()
+    city = str(row.get("city", "")).strip()
+    state = str(row.get("state", "")).strip()
 
-# Save the results
+    matches = get_npis_with_taxonomy(name, city, state, target_taxonomy=TARGET_TAXONOMY)
+    # choose the best match: prefer exact org name (normalized) if available, else first
+    n_name = _norm(name)
+    exact = [m for m in matches if _norm(m["name"]) == n_name]
+    chosen = (exact[0] if exact else (matches[0] if matches else {"npi": "Not Found"}))
+    df.at[idx, "NPI"] = chosen["npi"]
+    print(f"Processed {name} in {city}, {state} - NPI: {chosen['npi']}")
+
 df.to_excel(output_filepath, index=False)
 print("Done! Saved to", output_filepath)
+
