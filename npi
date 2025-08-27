@@ -1,0 +1,64 @@
+import pandas as pd
+import requests
+
+def get_npis_with_taxonomy(name, city, state, target_taxonomy="General Acute Care Hospital"):
+    api_url = "https://npiregistry.cms.hhs.gov/api/"
+    params = {
+        "version": "2.1",
+        "organization_name": name,
+        "city": city,
+        "state": state,
+        "limit": 20  # Fetch more results to find the best match
+    }
+    try:
+        response = requests.get(api_url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        results = data.get('results', [])
+        
+        # Collect all NPIs with the target taxonomy
+        matched_npis = []
+        for result in results:
+            taxonomies = result.get('taxonomies', [])
+            taxonomy_descs = [tax.get('desc', '') for tax in taxonomies]
+            if target_taxonomy in taxonomy_descs:
+                matched_npis.append({
+                    'npi': result.get('number', ''),
+                    'name': result.get('organization_name', ''),
+                    'city': result.get('city', ''),
+                    'state': result.get('state', ''),
+                    'taxonomies': taxonomy_descs
+                })
+        
+        # Print each match found
+        for match in matched_npis:
+            print(f"Match Found: NPI: {match['npi']}, Name: {match['name']}, Location: {match['city']}, {match['state']}, Taxonomies: {match['taxonomies']}")
+        
+        # Return the first match or "Not Found"
+        if matched_npis:
+            return matched_npis[0]['npi']
+        else:
+            return "Not Found"
+    except Exception as e:
+        print(f"Error fetching NPIs for {name}: {e}")
+        return "Error"
+
+# Load your data
+input_filepath = "test_unknown_joint_knee_npi.xlsx"
+output_filepath = "test_unknown_acuitymd_npi_here_2025_knee_surg.xlsx"
+
+df = pd.read_excel(input_filepath)
+df['NPI'] = ""
+
+# Loop through each row to get NPIs based on the organization details
+for idx, row in df.iterrows():
+    name = row['name']
+    city = row['city']
+    state = row['state']
+    npi = get_npis_with_taxonomy(name, city, state)
+    df.at[idx, 'NPI'] = npi
+    print(f"Processed {name} in {city}, {state} - NPI: {npi}")
+
+# Save the results
+df.to_excel(output_filepath, index=False)
+print("Done! Saved to", output_filepath)
