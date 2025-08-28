@@ -1,0 +1,106 @@
+// Two helper functions below:
+
+//function one: NPPESfetch
+
+
+let
+  NppesFetch = (state as text, optional city as nullable text) as table =>
+  let
+    // fetch one page (limit=200) by skip
+    Page = (skip as number) =>
+      let
+        Source = Json.Document(
+          Web.Contents(
+            "https://npiregistry.cms.hhs.gov/api/",
+            [
+              Query = 
+                [ version = "2.1", enumeration_type = "NPI-2", state = state, limit = "200", skip = Text.From(skip) ] &
+                ( if city <> null and city <> "" then [ city = city ] else [] )
+            ]
+          )
+        ),
+        Results = try Source[results] otherwise null
+      in
+        if Results = null then {} else Results,
+
+    // stream pages until fewer than 200, or skip > 1000
+    Pages = List.Generate(
+      () => [k = 0, batch = Page(0)],
+      each List.Count([batch]) > 0 and [k] <= 1000,
+      each [k = [k] + 200, batch = Page([k])],
+      each [batch]
+    ),
+    Flat = List.Combine(Pages),
+
+    // project just what we need
+    ToRows =
+      List.Transform(
+        Flat,
+        (r) =>
+          let
+            basic  = try r[basic] otherwise null,
+            adds   = try r[addresses] otherwise null,
+            loc    = if adds <> null and List.Count(adds) > 0 then adds{0} else null,
+            taxes  = try r[taxonomies] otherwise null,
+            taxDescs = if taxes = null then {} else List.Transform(taxes, each try _[desc] otherwise null)
+          in
+            [
+              npi       = Text.From(try r[number] otherwise null),
+              org_name  = try basic[organization_name] otherwise null,
+              city      = try loc[city] otherwise null,
+              state     = try loc[state] otherwise null,
+              address1  = try loc[address_1] otherwise null,
+              taxonomies= Text.Combine(List.RemoveNulls(taxDescs), " | ")
+            ]
+      ),
+    TableOut = Table.FromRecords(ToRows)
+  in
+    TableOut
+in
+  NppesFetch
+
+
+//functions two: StreetTokens
+
+
+let
+  StreetTokens = (s as nullable text) as text =>
+  let
+    s0 = if s=null then "" else Text.Lower(s),
+    s1 = Text.Replace(Text.Replace(Text.Replace(Text.Replace(Text.Replace(Text.Replace(s0,".",""),"#",""),",",""),"/"," "),"-"," "), " st ", " saint "),
+    wordsRaw = List.Select(Text.SplitAny(s1," "), each _ <> ""),
+    drops = {"street","st","saint","avenue","ave","road","rd","boulevard","blvd","lane","ln","drive","dr","highway","hwy","terrace","ter","parkway","pkwy","place","pl","court","ct","way","cir","circle",
+             "n","s","e","w","ne","nw","se","sw","suite","ste","unit","apt"},
+    words = List.RemoveItems(wordsRaw, drops),
+    nums   = List.Select(words, each (try Number.From(_) otherwise null) <> null),
+    house  = if List.IsEmpty(nums) then null else List.First(nums),
+    alphas = List.Select(words, each (try Number.From(_) otherwise null) = null),
+    first2 = List.FirstN(alphas, 2),
+    toks   = List.RemoveNulls( List.Combine( { if house=null then {} else {Text.From(house)}, first2 } ) ),
+    key    = Text.Combine(toks, "|")
+  in
+    key
+in
+  StreetTokens
+
+//function three: Candidates
+
+let
+  // Distinct city/state pairs from your input
+  Cities = Table.Distinct(Table.SelectColumns(InputTable, {"state","city"})),
+
+  // For each pair, call the API (batched & paged), then expand
+  WithCandidates = Table.AddColumn(Cities, "Candidates", each NppesFetch([state],[city])),
+  Expanded = Table.ExpandTableColumn(WithCandidates, "Candidates",
+              {"npi","org_name","state","city","address1","taxonomies"},
+              {"npi","org_name","state","city","address1","taxonomies"}),
+
+  // token for address matching
+  WithTok = Table.AddColumn(Expanded, "Tok", each StreetTokens([address1]), type text),
+
+  // Keep only the columns we need for joining
+  Out = Table.SelectColumns(WithTok, {"state","city","Tok","npi","taxonomies"})
+in
+  Out
+
+
