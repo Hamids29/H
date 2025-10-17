@@ -1,0 +1,146 @@
+import re, time, unicodedata
+import pandas as pd
+import requests
+
+# ----------------- CONFIG -----------------
+BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
+LIMIT_PER_REQ = 200
+MAX_PAGES = 6
+TARGET_TAXONOMY = "General Acute Care Hospital"
+
+# ----------------- HELPERS -----------------
+def _norm(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+def _primary_location_addr(addresses):
+    return (addresses or [{}])[0] or {}
+
+def _street_tokens(address1: str) -> set:
+    s = _norm(address1)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = s.replace(" st ", " saint ")
+    drops = {
+        "street","st","saint","avenue","ave","road","rd","boulevard","blvd","lane","ln",
+        "drive","dr","highway","hwy","terrace","ter","parkway","pkwy","place","pl",
+        "court","ct","way","cir","circle",
+        "n","s","e","w","ne","nw","se","sw","suite","ste","unit","apt","#"
+    }
+    toks = [t for t in s.split() if t and t not in drops]
+    nums = [t for t in toks if t.isdigit()]
+    alphas = [t for t in toks if not t.isdigit()]
+    keep = set()
+    if nums: keep.add(nums[0])
+    if alphas:
+        keep.add(alphas[0])
+        if len(alphas) > 1: keep.add(alphas[1])
+    return keep
+
+def _addr_matches(addr_api: str, addr_input: str) -> bool:
+    if not addr_api or not addr_input: return False
+    api = _norm(addr_api).replace(" st ", " saint ")
+    api = re.sub(r"[^a-z0-9\s]", " ", api)
+    tokens = _street_tokens(addr_input)
+    api_words = set(api.split())
+    return all(tok in api_words for tok in tokens)
+
+def _has_taxonomy(r, target_taxonomy: str) -> bool:
+    want = _norm(target_taxonomy)
+    tax = {_norm(t.get("desc","")) for t in (r.get("taxonomies") or [])}
+    return want in tax
+
+def _choose_by_priority(cands_addr, cands_city, target_taxonomy: str) -> str:
+    pools = [
+        [r for r in cands_addr if _has_taxonomy(r, target_taxonomy)],
+        [r for r in cands_addr if not _has_taxonomy(r, target_taxonomy)],
+        [r for r in cands_city if _has_taxonomy(r, target_taxonomy)],
+        [r for r in cands_city if not _has_taxonomy(r, target_taxonomy)],
+    ]
+    for pool in pools:
+        if pool:
+            return str(pool[0].get("number","Not Found"))
+    return "Not Found"
+
+def _fetch_candidates(state: str, city: str | None) -> list:
+    params = {"version":"2.1","enumeration_type":"NPI-2","state":state,"limit":LIMIT_PER_REQ}
+    if city: params["city"] = city
+    all_results, skip = [], 0
+    for _ in range(MAX_PAGES):
+        params["skip"] = skip
+        r = requests.get(BASE_URL, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        batch = data.get("results", []) or []
+        if not batch: break
+        all_results.extend(batch)
+        if len(batch) < params["limit"] or skip >= 1000: break
+        skip += params["limit"]
+        time.sleep(0.15)  # be polite
+    return all_results
+
+# --------------- POWER BI ENTRY ---------------
+df = dataset.copy()  # <- this is your 'Raw Data' rows at this step
+
+# Normalize expected columns
+cols = {c.lower(): c for c in df.columns}
+city_col  = cols.get("city")
+state_col = cols.get("state")
+addr_col  = cols.get("address1") or cols.get("address_1")
+
+if not city_col or not state_col:
+    raise ValueError("Expected columns 'city' and 'state' not found in the incoming table.")
+
+# Prepare output column
+if "NPI" not in df.columns:
+    df["NPI"] = ""
+
+# Build a cache of API candidates per (state, city) to avoid repeated calls
+keys = (
+    df[[city_col, state_col]]
+    .fillna("")
+    .assign(_city=lambda x: x[city_col].astype(str).str.strip(),
+            _state=lambda x: x[state_col].astype(str).str.strip())
+    .loc[:, ["_city","_state"]]
+    .drop_duplicates()
+    .itertuples(index=False, name=None)
+)
+
+cand_cache = {}
+for city, state in keys:
+    try:
+        cands = _fetch_candidates(state, city)
+        if not cands:
+            cands = _fetch_candidates(state, None)
+        # Filter to matching state/city (post-fetch sanity)
+        keep = []
+        for r in cands:
+            addr = _primary_location_addr(r.get("addresses", []))
+            if _norm(addr.get("state")) != _norm(state): 
+                continue
+            if _norm(city) and _norm(addr.get("city")) != _norm(city):
+                continue
+            keep.append(r)
+        cand_cache[(city, state)] = keep
+    except Exception:
+        cand_cache[(city, state)] = []
+
+# Resolve NPI row-by-row using cached candidates (fast)
+def resolve_row(row):
+    city   = str(row.get(city_col, "")).strip()
+    state  = str(row.get(state_col, "")).strip()
+    addr_i = str(row.get(addr_col, "")).strip() if addr_col else ""
+    cands  = cand_cache.get((city, state), [])
+    cands_addr, cands_city = [], []
+    for r in cands:
+        addr_api = _primary_location_addr(r.get("addresses", [])).get("address_1", "")
+        if addr_i and _addr_matches(addr_api, addr_i):
+            cands_addr.append(r)
+        else:
+            cands_city.append(r)
+    return _choose_by_priority(cands_addr, cands_city, TARGET_TAXONOMY)
+
+df["NPI"] = df.apply(resolve_row, axis=1)
+
+# Return the final table (must be the last expression)
+df
