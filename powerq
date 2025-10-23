@@ -1,0 +1,78 @@
+// fnNPI(state as text, optional city as nullable text, optional enumeration as nullable text, optional taxonomy as nullable text) as table
+(let
+    state as text,
+    optional city as nullable text,
+    optional enumeration as nullable text,
+    optional taxonomy as nullable text
+) as table =>
+let
+    BaseUrl = "https://npiregistry.cms.hhs.gov/api/",
+    // Defaults: individuals (NPI-1). Change taxonomy as needed (e.g., "Orthopedic Surgery")
+    Enumeration = if enumeration = null then "NPI-1" else enumeration,
+    Taxonomy    = if taxonomy = null then null else taxonomy,
+    Limit       = 200,
+
+    // Build one page
+    Page = (skip as number) as table =>
+        let
+            QueryParams =
+                if city <> null and city <> "" then
+                    [
+                      version = "2.1",
+                      enumeration_type = Enumeration,
+                      state = state,
+                      city = city,
+                      limit = Text.From(Limit),
+                      skip = Text.From(skip)
+                    ]
+                else
+                    [
+                      version = "2.1",
+                      enumeration_type = Enumeration,
+                      state = state,
+                      limit = Text.From(Limit),
+                      skip = Text.From(skip)
+                    ],
+            QueryWithTax =
+                if Taxonomy <> null and Taxonomy <> "" then
+                    Record.AddField(QueryParams, "taxonomy_description", Taxonomy)
+                else
+                    QueryParams,
+
+            Source = Json.Document(
+                Web.Contents(
+                    BaseUrl,
+                    [
+                      RelativePath = "",
+                      Query = QueryWithTax
+                    ]
+                )
+            ),
+
+            Results = try Source[results] otherwise {},
+            Tbl = Table.FromList(Results, Splitter.SplitByNothing(), {"rec"}, null, ExtraValues.Error),
+
+            // Flatten the bits we care about (adjust as needed)
+            ExpandBasic   = Table.ExpandRecordColumn(Tbl, "rec", {"number","enumeration_type","basic","addresses","taxonomies"}, {"npi","enumeration_type","basic","addresses","taxonomies"}),
+            ExpandBasic2  = Table.ExpandRecordColumn(ExpandBasic, "basic", {"first_name","last_name","organization_name"}, {"first_name","last_name","organization_name"}),
+            // Take the first practice address
+            AddAddr       = Table.AddColumn(ExpandBasic2, "addr1", each try [addresses]{0}[address_1] otherwise null, type text),
+            AddCity       = Table.AddColumn(AddAddr,  "city_api", each try [addresses]{0}[city]      otherwise null, type text),
+            AddState      = Table.AddColumn(AddCity,  "state_api",each try [addresses]{0}[state]     otherwise null, type text),
+            AddZip        = Table.AddColumn(AddState, "zip_api",  each try [addresses]{0}[postal_code] otherwise null, type text),
+            KeepCols      = Table.SelectColumns(AddZip, {"npi","enumeration_type","first_name","last_name","organization_name","addr1","city_api","state_api","zip_api","taxonomies"})
+        in
+            KeepCols,
+
+    // Paginate until less than Limit
+    Pages =
+        List.Generate(
+            () => [skip = 0, t = Page(0)],
+            each Table.RowCount([t]) > 0,
+            each [skip = [skip] + Limit, t = Page([skip])],
+            each [t]
+        ),
+    Combined = Table.Combine(Pages)
+in
+    Combined
+)
