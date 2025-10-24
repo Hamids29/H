@@ -1,0 +1,43 @@
+addr_pd = addr_keys.toPandas()
+addr_pd["npi"] = ""
+
+for i, row in addr_pd.iterrows():
+    npi, _, _ = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=row["n_addr1"],
+        zip5=row.get("n_zip5","") or ""
+    )
+    addr_pd.at[i, "npi"] = npi
+
+addr_map = spark.createDataFrame(addr_pd[["n_state","n_city","n_addr1","n_zip5","npi"]])
+addr_map.createOrReplaceTempView("addr_map")
+
+
+#thennn addd
+
+df_norm.createOrReplaceTempView("raw_norm")
+
+enriched = spark.sql("""
+WITH addr_join AS (
+  SELECT r.*, a.npi AS npi_addr
+  FROM raw_norm r
+  LEFT JOIN addr_map a
+    ON r.n_state = a.n_state
+   AND r.n_city  = a.n_city
+   AND r.n_addr1 = a.n_addr1
+),
+city_join AS (
+  SELECT aj.*, c.npi AS npi_city
+  FROM addr_join aj
+  LEFT JOIN city_map c
+    ON aj.n_state = c.n_state
+   AND aj.n_city  = c.n_city
+)
+SELECT
+  *,
+  CASE WHEN npi_addr IS NOT NULL AND npi_addr <> '' THEN npi_addr
+       WHEN npi_city IS NOT NULL AND npi_city <> '' THEN npi_city
+       ELSE '' END AS npi
+FROM city_join
+""").drop("npi_addr","npi_city")
