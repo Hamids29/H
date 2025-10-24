@@ -8,6 +8,11 @@ CITY_COL = None      # e.g. "city"
 STATE_COL = None     # e.g. "state"
 ADDR1_COL = None     # e.g. "address1" or "address_1"
 
+# CMS taxonomy targeting (Hospital orgs). Adjust if needed.
+TARGET_TAXONOMY_DESC  = "General Acute Care Hospital"
+TARGET_TAXONOMY_CODES = {"282N00000X"}
+
+
 
 #cell 2
 import re, time, unicodedata, requests
