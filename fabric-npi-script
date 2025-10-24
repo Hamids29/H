@@ -12,34 +12,38 @@ ADDR1_COL = None     # e.g. "address1" or "address_1"
 #cell 2
 import re, time, unicodedata, requests
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple, List
 
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-# ---------- CMS / matching config ----------
+# ---------- CMS / request config ----------
 BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
 LIMIT_PER_REQ = 200
 MAX_PAGES = 6
 USER_AGENT = "Fabric-NPI-Resolver/1.0 (+you@company)"
-TARGET_TAXONOMY_DESC = "General Acute Care Hospital"  # description match
-TARGET_TAXONOMY_CODES = {"282N00000X"}                # code match (org hospitals)
 
-# ---------- normalization (Python) ----------
+# ---------- normalization ----------
 def _norm(s: str) -> str:
     if not s: return ""
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"\s+", " ", s.lower()).strip()
+
+def _zip5(s: str) -> str:
+    if not s: return ""
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    return digits[:5] if digits else ""
 
 def _street_tokens(address1: str) -> set:
     s = _norm(address1)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\b(st)\b", "saint", s)  # 'St Francis' -> 'saint'
+    # 'St' (as a word) often means 'Saint' in hospital streets (e.g., St Francis)
+    s = re.sub(r"\b(st)\b", "saint", s)
     drops = {
         "street","saint","st","avenue","ave","road","rd","boulevard","blvd","lane","ln",
         "drive","dr","highway","hwy","terrace","ter","parkway","pkwy","place","pl",
-        "court","ct","way","cir","circle",
-        "n","s","e","w","ne","nw","se","sw","suite","ste","unit","apt","#"
+        "court","ct","way","cir","circle", "n","s","e","w","ne","nw","se","sw",
+        "suite","ste","unit","apt","#"
     }
     toks = [t for t in s.split() if t and t not in drops]
     nums = [t for t in toks if t.isdigit()]
@@ -60,29 +64,20 @@ def _addr_matches(addr_api: str, addr_input: str) -> bool:
     api_words = set(api.split())
     return all(tok in api_words for tok in tokens)
 
-def _primary_location_addr(addresses: list[dict]) -> dict:
+def _primary_location_addr(addresses: List[dict]) -> dict:
     addresses = addresses or []
     for a in addresses:
-        if (_norm(a.get("address_purpose")) == "location") or (_norm(a.get("purpose")) == "location"):
+        # some responses use 'address_purpose', others 'purpose'
+        if _norm(a.get("address_purpose") or a.get("purpose")) == "location":
             return a
     return addresses[0] if addresses else {}
 
-def _has_taxonomy(r: dict, want_desc: str, want_codes: set[str]) -> bool:
+def _has_taxonomy(r: dict, want_desc: str, want_codes: set) -> bool:
     want = _norm(want_desc)
     tax = r.get("taxonomies") or []
     desc_hit = any(_norm(t.get("desc","")) == want for t in tax)
     code_hit = any(_norm(t.get("code","")) in {c.lower() for c in want_codes} for t in tax)
     return desc_hit or code_hit
-
-def _score_candidate(r: dict, address1: str) -> tuple[int, str]:
-    addr = _primary_location_addr(r.get("addresses", []))
-    has_addr = _addr_matches(addr.get("address_1",""), address1) if address1 else False
-    has_tax = _has_taxonomy(r, TARGET_TAXONOMY_DESC, TARGET_TAXONOMY_CODES)
-
-    if has_addr and has_tax:   return 4, "address+taxonomy"
-    if has_addr:               return 3, "address-only"
-    if has_tax:                return 2, "city+taxonomy"
-    return 1, "city-only"
 
 def _request_with_retries(url: str, params: dict, max_tries=5) -> dict:
     backoff = 0.5
@@ -104,7 +99,7 @@ def _request_with_retries(url: str, params: dict, max_tries=5) -> dict:
 def _fetch_candidates(state: str, city: Optional[str]) -> list:
     params = {
         "version": "2.1",
-        "enumeration_type": "NPI-2",
+        "enumeration_type": "NPI-2",  # orgs
         "state": state,
         "limit": LIMIT_PER_REQ
     }
@@ -122,13 +117,37 @@ def _fetch_candidates(state: str, city: Optional[str]) -> list:
         if len(batch) < params["limit"] or skip >= 1000:
             break
         skip += params["limit"]
-        time.sleep(0.15)
+        time.sleep(0.15)  # be polite
     return all_results
 
-def resolve_npi(city: str, state: str, address1: Optional[str]) -> tuple[str, str, int]:
+def _score_candidate(r: dict, address1: str, want_desc: str, want_codes: set, zip5: str = "") -> Tuple[int, str]:
+    addr = _primary_location_addr(r.get("addresses", []))
+    has_addr = _addr_matches(addr.get("address_1",""), address1) if address1 else False
+    has_tax  = _has_taxonomy(r, want_desc, want_codes)
+
+    # Base tiers
+    if has_addr and has_tax:
+        score, basis = 4, "address+taxonomy"
+    elif has_addr:
+        score, basis = 3, "address-only"
+    elif has_tax:
+        score, basis = 2, "city+taxonomy"
+    else:
+        score, basis = 1, "city-only"
+
+    # ZIP preference bonus
+    if zip5 and _zip5(addr.get("postal_code")) == zip5:
+        score += 1
+        basis += "+zip"
+    return score, basis
+
+def resolve_npi(city: str, state: str, address1: Optional[str], zip5: str = "",
+                want_desc: str = TARGET_TAXONOMY_DESC,
+                want_codes: set = TARGET_TAXONOMY_CODES) -> Tuple[str, str, int]:
     n_city, n_state = _norm(city), _norm(state)
     cands = _fetch_candidates(state.upper(), city) or _fetch_candidates(state.upper(), None)
 
+    # keep candidates that match state/city on their LOCATION address
     keep = []
     for r in cands:
         addr = _primary_location_addr(r.get("addresses", []))
@@ -141,98 +160,118 @@ def resolve_npi(city: str, state: str, address1: Optional[str]) -> tuple[str, st
     if not keep:
         return "", "no-candidates", 0
 
-    # score + choose best
-    best_score, best_basis, best = 0, "city-only", None
-    for r in keep:
-        score, basis = _score_candidate(r, address1 or "")
+    # If zip provided, prefer those with same ZIP
+    if zip5:
+        same_zip = []
+        other_zip = []
+        for r in keep:
+            a_zip = _zip5(_primary_location_addr(r.get("addresses", [])).get("postal_code"))
+            (same_zip if a_zip == zip5 else other_zip).append(r)
+        pool = same_zip or other_zip
+    else:
+        pool = keep
+
+    # Score and pick best
+    best_score, best_basis, best = -1, "city-only", None
+    for r in pool:
+        score, basis = _score_candidate(r, address1 or "", want_desc, want_codes, zip5)
         if score > best_score:
             best_score, best_basis, best = score, basis, r
 
     npi = str(best.get("number","")) if (best and best.get("number")) else ""
-    return npi, best_basis, best_score
+    return npi, best_basis, int(best_score)
 
 
 #cell 3
 
 # Load your Lakehouse table
+
+# Load source table
 src = spark.read.table(SOURCE_TABLE)
 
-# Try to auto-detect city/state/address1 if not provided
+# Auto-detect missing column names by simple heuristics
 cols_lc = {c.lower(): c for c in src.columns}
 
-def _guess(wants: list[str]) -> Optional[str]:
+def _guess(wants):
     for w in wants:
-        if w in cols_lc: return cols_lc[w]
-    # fuzzy contains
+        if w in cols_lc:
+            return cols_lc[w]
     for c in src.columns:
         cl = c.lower()
         if any(w in cl for w in wants):
             return c
     return None
 
-if CITY_COL is None:
-    CITY_COL = _guess(["city","practice_city","physician_city","location_city","facility_city"])
-if STATE_COL is None:
-    STATE_COL = _guess(["state","practice_state","physician_state","location_state","facility_state"])
-if ADDR1_COL is None:
-    ADDR1_COL = _guess(["address1","address_1","addr1","street","address line 1".lower()])
+if CITY_COL  is None: CITY_COL  = _guess(["city","practice_city","physician_city","location_city","facility_city"])
+if STATE_COL is None: STATE_COL = _guess(["state","practice_state","physician_state","location_state","facility_state"])
+if ADDR1_COL is None: ADDR1_COL = _guess(["address1","address_1","addr1","street","address line 1"])
+if ZIP_COL   is None: ZIP_COL   = _guess(["zip","zipcode","postal_code","postalcode","zip_code"])
 
 print("Detected columns ->",
-      "CITY:", CITY_COL, "| STATE:", STATE_COL, "| ADDRESS1:", ADDR1_COL)
+      "CITY:", CITY_COL, "| STATE:", STATE_COL, "| ADDRESS1:", ADDR1_COL, "| ZIP:", ZIP_COL)
 
-# Basic sanity check
-assert CITY_COL and STATE_COL, "Could not detect city/state columns—please set CITY_COL/STATE_COL manually."
+assert CITY_COL and STATE_COL, "Could not detect city/state columns — please set CITY_COL/STATE_COL explicitly."
 
 
 #cell 4
 
-# Python UDFs for normalization (Spark columns -> normalized strings)
 @F.udf(T.StringType())
-def norm_udf(s):
-    return _norm(s) if s is not None else ""
+def norm_udf(s): return _norm(s) if s is not None else ""
 
 @F.udf(T.StringType())
-def safe_str_udf(s):
-    return str(s).strip() if s is not None else ""
+def zip5_udf(z): return _zip5(z) if z is not None else ""
 
 df_norm = (
     src
     .withColumn("n_city",  norm_udf(F.col(CITY_COL)))
     .withColumn("n_state", norm_udf(F.col(STATE_COL)))
-    .withColumn("n_addr1", norm_udf(F.col(ADDR1_COL)) if ADDR1_COL else F.lit(""))
 )
 
-# Unique keys at address+city level, then city-only fallback
+if ADDR1_COL:
+    df_norm = df_norm.withColumn("n_addr1", norm_udf(F.col(ADDR1_COL)))
+else:
+    df_norm = df_norm.withColumn("n_addr1", F.lit(""))
+
+if ZIP_COL:
+    df_norm = df_norm.withColumn("n_zip5", zip5_udf(F.col(ZIP_COL)))
+else:
+    df_norm = df_norm.withColumn("n_zip5", F.lit(""))
+
+# Unique keys for API calls (address-level preferred; also city-level)
 addr_keys = (
     df_norm
-    .select("n_state","n_city","n_addr1")
+    .select("n_state","n_city","n_addr1","n_zip5")
     .where(F.col("n_state") != "")
     .dropDuplicates()
 )
 
 city_keys = (
     df_norm
-    .select("n_state","n_city")
+    .select("n_state","n_city","n_zip5")
     .where(F.col("n_state") != "")
     .dropDuplicates()
 )
 
-addr_keys_count = addr_keys.count()
-city_keys_count = city_keys.count()
-print("Unique addr-level keys:", addr_keys_count, "| Unique city-level keys:", city_keys_count)
+print("Unique addr-level keys:", addr_keys.count(), "| Unique city-level keys:", city_keys.count())
+
 
 
 #cell 5
 
-# Address-level resolution (preferred)
-addr_pd = addr_keys.toPandas()  # collect unique keys to driver
+# Address-level resolution
+addr_pd = addr_keys.toPandas()  # Collect unique keys to driver; OK if not huge. If huge, batch by state.
 addr_pd["npi"] = ""
 addr_pd["match_basis"] = ""
 addr_pd["match_score"] = 0
 addr_pd["npi_found"] = False
 
 for i, row in addr_pd.iterrows():
-    npi, basis, score = resolve_npi(row["n_city"], row["n_state"], row["n_addr1"])
+    npi, basis, score = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=row["n_addr1"],
+        zip5=row.get("n_zip5","") or ""
+    )
     addr_pd.at[i, "npi"] = npi
     addr_pd.at[i, "match_basis"] = basis
     addr_pd.at[i, "match_score"] = int(score)
@@ -243,8 +282,7 @@ addr_map.createOrReplaceTempView("addr_map")
 
 
 #alternative for missing address using city (optional)
-
-# City-level resolution (fallback for missing/blank address1)
+# City-level resolution (fallback for blank/missing/poor street matches)
 city_pd = city_keys.toPandas()
 city_pd["npi"] = ""
 city_pd["match_basis"] = ""
@@ -252,7 +290,12 @@ city_pd["match_score"] = 0
 city_pd["npi_found"] = False
 
 for i, row in city_pd.iterrows():
-    npi, basis, score = resolve_npi(row["n_city"], row["n_state"], address1=None)
+    npi, basis, score = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=None,
+        zip5=row.get("n_zip5","") or ""
+    )
     city_pd.at[i, "npi"] = npi
     city_pd.at[i, "match_basis"] = basis
     city_pd.at[i, "match_score"] = int(score)
@@ -265,13 +308,13 @@ city_map.createOrReplaceTempView("city_map")
 
 df_norm.createOrReplaceTempView("raw_norm")
 
-enriched = spark.sql(f"""
+enriched = spark.sql("""
 WITH addr_join AS (
   SELECT r.*,
-         a.npi   AS npi_addr,
-         a.match_basis AS basis_addr,
-         a.match_score AS score_addr,
-         a.npi_found   AS found_addr
+         a.npi           AS npi_addr,
+         a.match_basis   AS basis_addr,
+         a.match_score   AS score_addr,
+         a.npi_found     AS found_addr
   FROM raw_norm r
   LEFT JOIN addr_map a
     ON r.n_state = a.n_state
@@ -280,10 +323,10 @@ WITH addr_join AS (
 ),
 city_join AS (
   SELECT aj.*,
-         c.npi   AS npi_city,
-         c.match_basis AS basis_city,
-         c.match_score AS score_city,
-         c.npi_found   AS found_city
+         c.npi           AS npi_city,
+         c.match_basis   AS basis_city,
+         c.match_score   AS score_city,
+         c.npi_found     AS found_city
   FROM addr_join aj
   LEFT JOIN city_map c
     ON aj.n_state = c.n_state
@@ -305,6 +348,14 @@ SELECT
        THEN TRUE ELSE FALSE END                      AS npi_found
 FROM city_join
 """)
+
+# Clean up helper columns if you like
+for c in ["npi_addr","basis_addr","score_addr","found_addr","npi_city","basis_city","score_city","found_city"]:
+    if c in enriched.columns:
+        enriched = enriched.drop(c)
+
+enriched.limit(5).display()
+
 
 # (Optional) Drop helper columns; keep normalized keys if useful for QA
 cols_to_drop = ["npi_addr","basis_addr","score_addr","found_addr",
