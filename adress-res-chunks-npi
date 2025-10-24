@@ -1,0 +1,90 @@
+# --- Address-level resolution with city prefetch + chunked writes ---
+
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math, time
+
+TEMP_TABLE = "cs_nextgen_lakehouse._addr_map_parts"  # temp output (append)
+MAX_WORKERS = 4   # be gentle to CMS; increase only if needed
+CHUNK = 1000      # flush to Delta every N rows
+
+# 1) Collect unique cities once
+city_pd = (
+    city_keys
+    .select("n_state","n_city","n_zip5")  # zip present for later scoring bonus
+    .toPandas()
+)
+unique_cities = city_pd[["n_state","n_city"]].drop_duplicates().to_dict("records")
+print(f"Unique (state, city): {len(unique_cities)}")
+
+# 2) Prefetch CMS candidates per (state, city) with limited concurrency
+def fetch_city(state, city):
+    # Uses the same cached fetcher as resolve_npi; zero extra work for repeats
+    try:
+        _ = _fetch_candidates(state.upper(), city) or _fetch_candidates(state.upper(), None)
+        return (state, city, "ok")
+    except Exception as e:
+        return (state, city, f"error:{type(e).__name__}")
+
+start = time.time()
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+    futs = {ex.submit(fetch_city, r["n_state"], r["n_city"]): (r["n_state"], r["n_city"]) for r in unique_cities}
+    done = 0
+    for fut in as_completed(futs):
+        done += 1
+        if done % 100 == 0:
+            print(f"Prefetched {done}/{len(futs)} cities")
+
+print(f"Prefetch complete in ~{int(time.time()-start)}s")
+
+# 3) Bring unique address keys to the driver
+addr_pd = addr_keys.toPandas()
+addr_pd["npi"] = ""
+addr_pd["match_basis"] = ""
+addr_pd["match_score"] = 0
+addr_pd["npi_found"] = False
+
+# 4) Score locally, no more HTTP (fetcher is already in cache)
+buffer = []
+rows = addr_pd.to_dict("records")
+total = len(rows)
+
+def resolve_from_cache(row):
+    # Same logic as resolve_npi but we rely on _fetch_candidates cache (no new HTTP)
+    npi, basis, score = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=row["n_addr1"],
+        zip5=row.get("n_zip5","") or ""
+    )
+    return {
+        "n_state": row["n_state"],
+        "n_city":  row["n_city"],
+        "n_addr1": row["n_addr1"],
+        "n_zip5":  row.get("n_zip5","") or "",
+        "npi": npi,
+        "match_basis": basis,
+        "match_score": int(score),
+        "npi_found": bool(npi)
+    }
+
+for i, row in enumerate(rows, 1):
+    buffer.append(resolve_from_cache(row))
+
+    if i % 200 == 0:
+        print(f"{i}/{total} scored...")
+
+    if i % CHUNK == 0:
+        spark.createDataFrame(pd.DataFrame(buffer)).write.mode("append").saveAsTable(TEMP_TABLE)
+        buffer = []
+        print(f"flushed {i} rows to {TEMP_TABLE}")
+
+# flush remainder
+if buffer:
+    spark.createDataFrame(pd.DataFrame(buffer)).write.mode("append").saveAsTable(TEMP_TABLE)
+    print("final flush")
+
+# 5) Use the accumulated parts as your addr_map
+addr_map = spark.table(TEMP_TABLE)
+addr_map.createOrReplaceTempView("addr_map")
+print("addr_map ready")
