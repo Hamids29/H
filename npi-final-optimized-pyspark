@@ -1,0 +1,286 @@
+# ---- REQUIRED: Lakehouse tables ----
+SOURCE_TABLE = "cs_nextgen_lakehouse.dbo_radar_p360_prcdr_by_physcn_all_raw"  # input
+TARGET_TABLE = "cs_nextgen_lakehouse.radar_p360_with_npi"                      # output (optional write)
+
+# ---- REQUIRED: exact column names in SOURCE_TABLE ----
+CITY_COL  = "city"         # e.g., "city"
+STATE_COL = "state"        # e.g., "state"
+ADDR1_COL = "address1"     # set to None if you truly have no street-address column
+ZIP_COL   = None           # e.g., "zip" or "postal_code"; keep None if you don't have it
+
+# ---- OPTIONAL: taxonomy targeting (kept minimal). For hospitals, this is fine. ----
+TARGET_TAXONOMY_DESC  = "General Acute Care Hospital"
+TARGET_TAXONOMY_CODES = {"282N00000X"}
+
+
+#cell 2
+
+import re, time, unicodedata, requests
+from functools import lru_cache
+from typing import Optional, Tuple
+
+from pyspark.sql import functions as F, types as T
+
+# --- Normalization helpers (strings -> normalized) ---
+def _norm(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii","ignore").decode("ascii")
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+def _zip5(s: str) -> str:
+    if not s: return ""
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    return digits[:5] if digits else ""
+
+def _street_tokens(address1: str) -> set:
+    s = _norm(address1)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\b(st)\b", "saint", s)  # 'St Francis' -> 'saint'
+    drops = {
+        "street","saint","st","avenue","ave","road","rd","boulevard","blvd","lane","ln",
+        "drive","dr","highway","hwy","terrace","ter","parkway","pkwy","place","pl",
+        "court","ct","way","cir","circle","n","s","e","w","ne","nw","se","sw",
+        "suite","ste","unit","apt","#"
+    }
+    toks = [t for t in s.split() if t and t not in drops]
+    nums = [t for t in toks if t.isdigit()]
+    alphas = [t for t in toks if not t.isdigit()]
+    keep = set()
+    if nums: keep.add(nums[0])
+    if alphas:
+        keep.add(alphas[0])
+        if len(alphas) > 1:
+            keep.add(alphas[1])
+    return keep
+
+def _addr_matches(addr_api: str, addr_input: str) -> bool:
+    if not addr_api or not addr_input: return False
+    api = _norm(addr_api)
+    api = re.sub(r"[^a-z0-9\s]", " ", api)
+    tokens = _street_tokens(addr_input)
+    api_words = set(api.split())
+    return all(tok in api_words for tok in tokens)
+
+def _primary_location_addr(addresses: list) -> dict:
+    addresses = addresses or []
+    for a in addresses:
+        if _norm(a.get("address_purpose") or a.get("purpose")) == "location":
+            return a
+    return addresses[0] if addresses else {}
+
+def _has_taxonomy(r: dict, want_desc: str, want_codes: set) -> bool:
+    want = _norm(want_desc)
+    tax = r.get("taxonomies") or []
+    desc_hit = any(_norm(t.get("desc","")) == want for t in tax)
+    code_hit = any(_norm(t.get("code","")) in {c.lower() for c in want_codes} for t in tax)
+    return desc_hit or code_hit
+
+# --- CMS API fetch (cached per (state, city)) ---
+BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
+LIMIT_PER_REQ = 200
+MAX_PAGES = 6
+USER_AGENT = "Fabric-NPI-Resolver/1.0"
+
+def _request_with_retries(params: dict, max_tries=5) -> dict:
+    backoff = 0.5
+    for i in range(max_tries):
+        try:
+            r = requests.get(BASE_URL, params=params, timeout=20, headers={"User-Agent": USER_AGENT})
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"HTTP {r.status_code}")
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if i == max_tries - 1:
+                raise
+            time.sleep(backoff); backoff *= 2
+    return {}
+
+@lru_cache(maxsize=4096)
+def _fetch_candidates(state: str, city: Optional[str]) -> list:
+    params = {"version":"2.1","enumeration_type":"NPI-2","state":state,"limit":LIMIT_PER_REQ}
+    if city: params["city"] = city
+    all_results, skip = [], 0
+    for _ in range(MAX_PAGES):
+        params["skip"] = skip
+        data = _request_with_retries(params)
+        batch = data.get("results", []) or []
+        if not batch: break
+        all_results.extend(batch)
+        if len(batch) < params["limit"] or skip >= 1000: break
+        skip += params["limit"]
+        time.sleep(0.15)
+    return all_results
+
+# --- Minimal resolver: returns ONLY NPI string (no scores/basis) ---
+def resolve_npi(city: str, state: str, address1: Optional[str], zip5: str = "") -> str:
+    n_city, n_state = _norm(city), _norm(state)
+    cands = _fetch_candidates(state.upper(), city) or _fetch_candidates(state.upper(), None)
+
+    keep = []
+    for r in cands:
+        addr = _primary_location_addr(r.get("addresses", []))
+        if _norm(addr.get("state")) != n_state:  continue
+        if n_city and _norm(addr.get("city")) != n_city:  continue
+        keep.append(r)
+
+    # Favor (address+taxonomy), else address-only, else city+taxonomy, else city-only.
+    def score(r: dict) -> int:
+        addr = _primary_location_addr(r.get("addresses", []))
+        has_addr = _addr_matches(addr.get("address_1",""), address1 or "")
+        has_tax  = _has_taxonomy(r, TARGET_TAXONOMY_DESC, TARGET_TAXONOMY_CODES)
+        s = (4 if has_addr and has_tax else
+             3 if has_addr else
+             2 if has_tax else
+             1)
+        if zip5 and _zip5(addr.get("postal_code")) == zip5:
+            s += 1  # soft preference for exact ZIP
+        return s
+
+    if not keep:
+        return ""
+
+    best = max(keep, key=score)
+    return str(best.get("number","")) if best.get("number") else ""
+
+#cell 3
+
+# Sanity checks
+assert isinstance(CITY_COL, str) and CITY_COL
+assert isinstance(STATE_COL, str) and STATE_COL
+# ADDR1_COL and ZIP_COL may be None by design
+
+src = spark.read.table(SOURCE_TABLE)
+
+# UDFs for normalization on Spark columns
+norm_udf = F.udf(lambda s: _norm(s) if s is not None else "", T.StringType())
+zip5_udf = F.udf(lambda z: _zip5(z) if z is not None else "", T.StringType())
+
+df_norm = (
+    src
+    .withColumn("n_city",  norm_udf(F.col(CITY_COL)))
+    .withColumn("n_state", norm_udf(F.col(STATE_COL)))
+)
+
+if ADDR1_COL:
+    df_norm = df_norm.withColumn("n_addr1", norm_udf(F.col(ADDR1_COL)))
+else:
+    df_norm = df_norm.withColumn("n_addr1", F.lit(""))
+
+if ZIP_COL:
+    df_norm = df_norm.withColumn("n_zip5", zip5_udf(F.col(ZIP_COL)))
+else:
+    df_norm = df_norm.withColumn("n_zip5", F.lit(""))
+
+# Unique key sets to minimize API calls
+addr_keys = (
+    df_norm.select("n_state","n_city","n_addr1","n_zip5")
+           .where(F.col("n_state") != "")
+           .dropDuplicates()
+)
+city_keys = (
+    df_norm.select("n_state","n_city","n_zip5")
+           .where(F.col("n_state") != "")
+           .dropDuplicates()
+)
+
+#cell 4
+
+
+# Address-level map
+addr_pd = addr_keys.toPandas()
+addr_pd["npi"] = ""
+
+for i, row in addr_pd.iterrows():
+    addr_pd.at[i, "npi"] = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=row["n_addr1"],
+        zip5=row.get("n_zip5","") or ""
+    )
+
+addr_map = spark.createDataFrame(addr_pd[["n_state","n_city","n_addr1","n_zip5","npi"]])
+addr_map.createOrReplaceTempView("addr_map")
+
+# City-level fallback map
+city_pd = city_keys.toPandas()
+city_pd["npi"] = ""
+
+for i, row in city_pd.iterrows():
+    city_pd.at[i, "npi"] = resolve_npi(
+        city=row["n_city"],
+        state=row["n_state"],
+        address1=None,
+        zip5=row.get("n_zip5","") or ""
+    )
+
+city_map = spark.createDataFrame(city_pd[["n_state","n_city","n_zip5","npi"]])
+city_map.createOrReplaceTempView("city_map")
+
+
+# cell 5
+
+df_norm.createOrReplaceTempView("raw_norm")
+
+enriched = spark.sql("""
+WITH addr_join AS (
+  SELECT r.*, a.npi AS npi_addr
+  FROM raw_norm r
+  LEFT JOIN addr_map a
+    ON r.n_state = a.n_state
+   AND r.n_city  = a.n_city
+   AND r.n_addr1 = a.n_addr1
+),
+city_join AS (
+  SELECT aj.*, c.npi AS npi_city
+  FROM addr_join aj
+  LEFT JOIN city_map c
+    ON aj.n_state = c.n_state
+   AND aj.n_city  = c.n_city
+)
+SELECT
+  aj.* EXCEPT(npi_addr, npi_city),
+  CASE WHEN aj.npi_addr IS NOT NULL AND aj.npi_addr <> '' THEN aj.npi_addr
+       WHEN city_join.npi_city IS NOT NULL AND city_join.npi_city <> '' THEN city_join.npi_city
+       ELSE '' END AS npi
+FROM addr_join aj
+LEFT JOIN city_join ON aj.n_state = city_join.n_state AND aj.n_city = city_join.n_city AND aj.n_addr1 = city_join.n_addr1
+""")
+
+
+#cell 6 if we cant use except:
+
+enriched = spark.sql("""
+WITH addr_join AS (
+  SELECT r.*, a.npi AS npi_addr
+  FROM raw_norm r
+  LEFT JOIN addr_map a
+    ON r.n_state = a.n_state
+   AND r.n_city  = a.n_city
+   AND r.n_addr1 = a.n_addr1
+),
+city_join AS (
+  SELECT aj.*, c.npi AS npi_city
+  FROM addr_join aj
+  LEFT JOIN city_map c
+    ON aj.n_state = c.n_state
+   AND aj.n_city  = c.n_city
+)
+SELECT
+  *,
+  CASE WHEN npi_addr IS NOT NULL AND npi_addr <> '' THEN npi_addr
+       WHEN npi_city IS NOT NULL AND npi_city <> '' THEN npi_city
+       ELSE '' END AS npi
+FROM city_join
+""").drop("npi_addr","npi_city")
+
+
+#optional to produce and save
+
+db_name = TARGET_TABLE.split(".")[0]
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {db_name}")
+enriched.write.mode("overwrite").option("mergeSchema","true").saveAsTable(TARGET_TABLE)
+
+print(f"Wrote enriched table to: {TARGET_TABLE}")
+
+
