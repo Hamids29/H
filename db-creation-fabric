@@ -1,0 +1,51 @@
+# Set your real source columns here
+CITY_COL  = "cmdm_hco_city"
+STATE_COL = "cmdm_hco_state"
+ADDR1_COL = "cmdm_hco_address"
+ZIP_COL   = "cmdm_hco_zip"   # or None
+
+# Build df_norm with n_* columns
+df_norm = (
+    src
+    .withColumn("n_city",  norm_udf(F.col(CITY_COL)))
+    .withColumn("n_state", norm_udf(F.col(STATE_COL)))
+    .withColumn("n_addr1", norm_udf(F.col(ADDR1_COL)) if ADDR1_COL else F.lit(""))
+    .withColumn("n_zip5",  zip5_udf(F.col(ZIP_COL))   if ZIP_COL   else F.lit(""))
+)
+
+# Keys from n_* columns
+addr_keys = df_norm.select("n_state","n_city","n_addr1","n_zip5").where(F.col("n_state")!="").dropDuplicates()
+city_keys = df_norm.select("n_state","n_city","n_zip5").where(F.col("n_state")!="").dropDuplicates()
+
+# After resolving, make sure addr_map / city_map ALSO use n_* column names:
+addr_map = spark.createDataFrame(addr_pd[["n_state","n_city","n_addr1","n_zip5","npi"]])
+addr_map.createOrReplaceTempView("addr_map")
+
+city_map = spark.createDataFrame(city_pd[["n_state","n_city","n_zip5","npi"]])
+city_map.createOrReplaceTempView("city_map")
+
+# Now the SQL will work because all three views share the same n_* join keys
+df_norm.createOrReplaceTempView("raw_norm")
+enriched = spark.sql("""
+WITH addr_join AS (
+  SELECT r.*, a.npi AS npi_addr
+  FROM raw_norm r
+  LEFT JOIN addr_map a
+    ON r.n_state = a.n_state
+   AND r.n_city  = a.n_city
+   AND r.n_addr1 = a.n_addr1
+),
+city_join AS (
+  SELECT aj.*, c.npi AS npi_city
+  FROM addr_join aj
+  LEFT JOIN city_map c
+    ON aj.n_state = c.n_state
+   AND aj.n_city  = c.n_city
+)
+SELECT
+  *,
+  CASE WHEN npi_addr IS NOT NULL AND npi_addr <> '' THEN npi_addr
+       WHEN npi_city IS NOT NULL AND npi_city <> '' THEN npi_city
+       ELSE '' END AS npi
+FROM city_join
+""").drop("npi_addr","npi_city")
