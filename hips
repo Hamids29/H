@@ -1,0 +1,12 @@
+Hips Eaches ÷ Hips Procedures :=
+DIVIDE(
+    CALCULATE(
+        [Eaches Sold],
+        KEEPFILTERS( 'dps_anatomy_sgmnt'[dps_anatomy_sgmnt] = "Hips" )
+    ),
+    CALCULATE(
+        [Total Procedures (selected year)],
+        KEEPFILTERS( 'dps_anatomy_sgmnt'[dps_anatomy_sgmnt] = "Hips" )
+    ),
+    0
+)
