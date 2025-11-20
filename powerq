@@ -1,15 +1,15 @@
-Platform Procedure Qty :=
+Platform Total Procedures :=
 VAR CurrPlat =
-    SELECTEDVALUE ( Platform[platform] )
+    SELECTEDVALUE( Platform[platform] )  -- Hips, Knees, Shoulders
 RETURN
-SUMX (
-    FILTER (
-        ALL ( Procedure ),   -- removes relationship filter so LPS rows are visible
+SUMX(
+    FILTER(
+        ALL( Procedure ),   -- remove visual-level filters that hide rows
         Procedure[column 0] = CurrPlat
             ||
         (
             Procedure[column 0] = "LPS"
-            && CONTAINSSTRING ( Procedure[column 6], CurrPlat )
+            && CONTAINSSTRING( Procedure[column 6], CurrPlat )
         )
     ),
     Procedure[procedure_qty]
